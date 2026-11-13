@@ -34,11 +34,38 @@ class PhoneModule : public IPhone, private concurrency::OSThread
     bool answer() override;
     bool hangUp() override;
 
+    // SMS, newest first. Safe from any task. Received ones live on the SIM; sent ones only until restart.
+    uint8_t smsCount() override;
+    bool smsGet(uint8_t position, PhoneSms &out) override;
+    bool sendSms(const char *number, const char *text) override;
+    bool deleteSms(uint8_t position) override;
+    void markSmsRead(uint8_t position) override;
+    uint16_t smsVersion() override;
+
   protected:
     int32_t runOnce() override;
 
   private:
-    enum class Job : uint8_t { None, Alive, Setup, Model, Sim, Operator, Registration, Volte, Signal, Battery, Gnss, User };
+    enum class Job : uint8_t {
+        None,
+        Alive,
+        Setup,
+        Model,
+        Sim,
+        Operator,
+        Registration,
+        Volte,
+        Signal,
+        Battery,
+        Gnss,
+        Storage,
+        User,
+        SmsList,
+        SmsRead,
+        SmsDelete,
+        SmsPrompt, // AT+CMGS sent, waiting for the modem's "> "
+        SmsBody    // the text sent, waiting for OK
+    };
 
     concurrency::Lock lock; // guards status and the queue
     PhoneStatus status;
@@ -67,8 +94,33 @@ class PhoneModule : public IPhone, private concurrency::OSThread
     uint32_t gnssStartedAt = 0;
     bool gnssRestart = false;
     bool ringtonePlaying = false;
+    bool tonePlaying = false;
+
+    // SMS
+    static constexpr uint8_t SMS_MAX = 30;   // held in RAM, newest first
+    static constexpr uint8_t SMS_QUEUE = 6;
+    PhoneSms smsList[SMS_MAX];
+    uint8_t smsHeld = 0;
+    uint16_t smsChanges = 0;
+    bool smsListWanted = false;
+    int16_t smsToRead[SMS_QUEUE] = {};
+    uint8_t smsToReadCount = 0;
+    int16_t smsToDelete[SMS_QUEUE] = {};
+    uint8_t smsToDeleteCount = 0;
+    bool smsOutPending = false;
+    char smsOutNumber[24] = "";
+    char smsOutText[161] = "";
+    PhoneSms smsBuilding;
+    bool smsBuildingActive = false;
+    int16_t smsReadingIndex = -1;
 
     void ring();
+    void playTone(const char *rtttl, size_t len);
+    void smsHeader(const char *l);
+    void smsFlush();
+    void smsKeep(const PhoneSms &m); // with the lock held
+    void smsRecount();               // with the lock held
+    void smsPromptArrived();
 
     void send(Job j, const char *cmd, uint32_t timeout);
     void finish(bool ok);

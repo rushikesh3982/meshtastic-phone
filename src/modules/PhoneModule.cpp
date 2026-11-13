@@ -29,14 +29,75 @@ constexpr uint32_t POLL_GAP_MS = 1500;   // one status question this often
 constexpr uint32_t ALIVE_GAP_MS = 2000;  // while the modem is off: one AT this often
 constexpr uint8_t LOST_AFTER = 3;        // unanswered ATs before the modem counts as off
 constexpr uint32_t GNSS_RETRY_MS = 90000; // GNSS off and on again if it hasn't said READY by then
-constexpr uint8_t POLL_STEPS = 8;
+constexpr uint8_t POLL_STEPS = 9;
 
 // The ringtone (RTTTL): a plain double ring, then a pause. The modem rings again every few seconds, and it repeats.
 const char RINGTONE[] = "ring:d=16,o=6,b=200:e,c,e,c,e,c,e,c,4p,e,c,e,c,e,c,e,c,1p";
+// A short rising chirp for a new SMS.
+const char SMS_TONE[] = "sms:d=16,o=6,b=180:c,e,g,8c7";
 
 // Lines the modem sends by itself, not as a reply to a question.
 const char *const EVENTS[] = {"RING",        "+CLIP:", "VOICE CALL:", "NO CARRIER", "BUSY",     "NO ANSWER",
                               "MISSED_CALL", "+CMTI:", "+CGNSSPWR:",  "*ATREADY",   "SMS DONE", "PB DONE"};
+
+bool validNumber(const char *number)
+{
+    size_t len = number ? strlen(number) : 0;
+    if (len == 0 || len > 20)
+        return false;
+    for (size_t i = 0; i < len; i++) {
+        char c = number[i];
+        if (!isdigit((unsigned char)c) && c != '+' && c != '*' && c != '#')
+            return false;
+    }
+    return true;
+}
+
+// The fields after a reply's colon, split at commas outside quotes, quotes removed, each cut to 27 characters.
+// For SMS headers, whose time ("26/11/13,10:30:00+22") has a comma inside its quotes.
+int quotedFields(const char *l, char out[][28], int maxFields)
+{
+    const char *p = strchr(l, ':');
+    p = p ? p + 1 : l;
+    while (*p == ' ')
+        p++;
+    int n = 0;
+    size_t len = 0;
+    bool inQuotes = false;
+    out[0][0] = 0;
+    for (;; p++) {
+        char c = *p;
+        if (c == '"') {
+            inQuotes = !inQuotes;
+            continue;
+        }
+        if (c == 0 || (c == ',' && !inQuotes)) {
+            out[n][len] = 0;
+            n++;
+            len = 0;
+            if (c == 0 || n >= maxFields)
+                break;
+            out[n][0] = 0;
+            continue;
+        }
+        if (len < 27)
+            out[n][len++] = c;
+    }
+    return n;
+}
+
+// Now, in the same form the network gives an SMS's time (yy/MM/dd,hh:mm:ss), from the T-Deck's clock.
+void timeNow(char *out, size_t len)
+{
+    uint32_t now = getValidTime(RTCQualityFromNet, true);
+    out[0] = 0;
+    if (!now)
+        return;
+    time_t t = now;
+    struct tm tm;
+    gmtime_r(&t, &tm);
+    strftime(out, len, "%y/%m/%d,%H:%M:%S", &tm);
+}
 
 bool startsWith(const char *s, const char *prefix)
 {
@@ -156,14 +217,8 @@ bool PhoneModule::queueCommand(const char *cmd)
 
 bool PhoneModule::dial(const char *number)
 {
-    size_t len = strlen(number);
-    if (len == 0 || len > 20)
+    if (!validNumber(number))
         return false;
-    for (size_t i = 0; i < len; i++) {
-        char c = number[i];
-        if (!isdigit((unsigned char)c) && c != '+' && c != '*' && c != '#')
-            return false;
-    }
     char cmd[32];
     snprintf(cmd, sizeof cmd, "ATD%s;", number);
     if (!queueCommand(cmd))
@@ -183,6 +238,178 @@ bool PhoneModule::answer()
 bool PhoneModule::hangUp()
 {
     return queueCommand("AT+CHUP");
+}
+
+uint8_t PhoneModule::smsCount()
+{
+    concurrency::LockGuard guard(&lock);
+    return smsHeld;
+}
+
+bool PhoneModule::smsGet(uint8_t position, PhoneSms &out)
+{
+    concurrency::LockGuard guard(&lock);
+    if (position >= smsHeld)
+        return false;
+    out = smsList[position];
+    return true;
+}
+
+uint16_t PhoneModule::smsVersion()
+{
+    concurrency::LockGuard guard(&lock);
+    return smsChanges;
+}
+
+void PhoneModule::markSmsRead(uint8_t position)
+{
+    concurrency::LockGuard guard(&lock);
+    if (position < smsHeld && smsList[position].unread) {
+        smsList[position].unread = false;
+        smsRecount();
+        smsChanges++;
+    }
+}
+
+bool PhoneModule::deleteSms(uint8_t position)
+{
+    concurrency::LockGuard guard(&lock);
+    if (position >= smsHeld)
+        return false;
+    int16_t index = smsList[position].index;
+    if (index >= 0) { // stored on the SIM: delete it there too
+        if (smsToDeleteCount >= SMS_QUEUE)
+            return false;
+        smsToDelete[smsToDeleteCount++] = index;
+    }
+    memmove(&smsList[position], &smsList[position + 1], (smsHeld - position - 1) * sizeof(PhoneSms));
+    smsHeld--;
+    smsRecount();
+    smsChanges++;
+    return true;
+}
+
+bool PhoneModule::sendSms(const char *number, const char *text)
+{
+    if (!validNumber(number) || !text || !text[0])
+        return false;
+    concurrency::LockGuard guard(&lock);
+    if (smsOutPending || status.smsSend == PhoneStatus::SMS_SENDING)
+        return false;
+    strlcpy(smsOutNumber, number, sizeof smsOutNumber);
+    // Plain text only: anything else would need the modem's UCS2 mode. Ctrl-Z and Esc would end the message early.
+    size_t n = 0;
+    for (const char *p = text; *p && n < sizeof smsOutText - 1; p++) {
+        unsigned char c = (unsigned char)*p;
+        smsOutText[n++] = (c == '\n' || (c >= 32 && c < 127)) ? (char)c : '?';
+    }
+    smsOutText[n] = 0;
+    smsOutPending = true;
+    status.smsSend = PhoneStatus::SMS_SENDING;
+    LOG_INFO("Phone: sending an SMS");
+    return true;
+}
+
+// With the lock held.
+void PhoneModule::smsRecount()
+{
+    uint8_t unread = 0;
+    for (uint8_t i = 0; i < smsHeld; i++) {
+        if (smsList[i].incoming && smsList[i].unread)
+            unread++;
+    }
+    status.unreadSms = unread;
+}
+
+// With the lock held: adds a message, newest first, replacing one with the same place on the SIM.
+void PhoneModule::smsKeep(const PhoneSms &m)
+{
+    if (m.index >= 0) {
+        for (uint8_t i = 0; i < smsHeld; i++) {
+            if (smsList[i].index == m.index) {
+                memmove(&smsList[i], &smsList[i + 1], (smsHeld - i - 1) * sizeof(PhoneSms));
+                smsHeld--;
+                break;
+            }
+        }
+    }
+    uint8_t at = 0;
+    while (at < smsHeld && strcmp(smsList[at].time, m.time) >= 0)
+        at++;
+    if (smsHeld == SMS_MAX) {
+        if (at >= SMS_MAX)
+            return; // older than everything held
+        smsHeld--; // the oldest goes
+    }
+    memmove(&smsList[at + 1], &smsList[at], (smsHeld - at) * sizeof(PhoneSms));
+    smsList[at] = m;
+    smsHeld++;
+    smsRecount();
+    smsChanges++;
+}
+
+// A message's header: +CMGL: <index>,<stat>,<number>,<name>,<time> or +CMGR: <stat>,<number>,<name>,<time>.
+void PhoneModule::smsHeader(const char *l)
+{
+    char f[6][28];
+    int n = quotedFields(l, f, 6);
+    PhoneSms m;
+    int o = 0;
+    if (startsWith(l, "+CMGL:")) {
+        m.index = (int16_t)atoi(f[0]);
+        o = 1;
+    } else {
+        m.index = smsReadingIndex;
+    }
+    if (n < o + 2 || strstr(f[o], "UNSENT"))
+        return; // a draft: not shown
+    m.incoming = startsWith(f[o], "REC");
+    m.unread = !strcmp(f[o], "REC UNREAD");
+    strlcpy(m.number, f[o + 1], sizeof m.number);
+    if (n > o + 3)
+        strlcpy(m.time, f[o + 3], sizeof m.time);
+    smsBuilding = m;
+    smsBuildingActive = true;
+}
+
+void PhoneModule::smsFlush()
+{
+    if (!smsBuildingActive)
+        return;
+    smsBuildingActive = false;
+    concurrency::LockGuard guard(&lock);
+    smsKeep(smsBuilding);
+}
+
+// The modem asks for the text ("> "): send it, ended with Ctrl-Z.
+void PhoneModule::smsPromptArrived()
+{
+    char text[sizeof smsOutText];
+    {
+        concurrency::LockGuard guard(&lock);
+        strlcpy(text, smsOutText, sizeof text);
+    }
+    Serial1.print(text);
+    Serial1.write((uint8_t)0x1A);
+    job = Job::SmsBody;
+    sentAt = millis();
+    timeoutMs = 60000; // the network can take a while
+    reply[0] = 0;
+}
+
+void PhoneModule::playTone(const char *rtttl, size_t len)
+{
+#ifdef HAS_I2S
+    bool idle;
+    {
+        concurrency::LockGuard guard(&lock);
+        idle = status.call == PhoneStatus::CALL_IDLE;
+    }
+    if (audioThread && idle && !ringtonePlaying) {
+        audioThread->beginRttl(rtttl, len);
+        tonePlaying = true;
+    }
+#endif
 }
 
 bool PhoneModule::gnssWanted()
@@ -207,7 +434,11 @@ int32_t PhoneModule::runOnce()
     if (job == Job::None)
         startNextJob();
     ring();
-    return (job == Job::None && !ringtonePlaying) ? 50 : 20;
+#ifdef HAS_I2S
+    if (tonePlaying && (!audioThread || !audioThread->isPlaying())) // isPlaying() also advances the tone
+        tonePlaying = false;
+#endif
+    return (job == Job::None && !ringtonePlaying && !tonePlaying) ? 50 : 20;
 }
 
 // The ringtone on the T-Deck's speaker while a call rings. The player only advances when asked (isPlaying), so this
@@ -248,6 +479,10 @@ void PhoneModule::readModem()
 {
     while (Serial1.available()) {
         char c = Serial1.read();
+        if (job == Job::SmsPrompt && c == '>' && lineLen == 0) {
+            smsPromptArrived();
+            continue;
+        }
         if (c == '\n') {
             while (lineLen && line[lineLen - 1] == ' ')
                 lineLen--;
@@ -274,6 +509,28 @@ void PhoneModule::onLine(const char *l)
     }
     if (event)
         return;
+    if (job == Job::SmsList || job == Job::SmsRead) { // a message's text can run over several lines
+        if (startsWith(l, "+CMGL:") || startsWith(l, "+CMGR:")) {
+            smsFlush();
+            smsHeader(l);
+        } else if (!strcmp(l, "OK")) {
+            smsFlush();
+            finish(true);
+        } else if (!strcmp(l, "ERROR") || startsWith(l, "+CME ERROR") || startsWith(l, "+CMS ERROR")) {
+            smsBuildingActive = false;
+            strlcpy(reply, l, sizeof reply);
+            finish(false);
+        } else if (smsBuildingActive) {
+            char *t = smsBuilding.text;
+            size_t used = strlen(t);
+            if (used && used < sizeof smsBuilding.text - 1)
+                t[used++] = '\n';
+            for (const char *p = l; *p && used < sizeof smsBuilding.text - 1; p++)
+                t[used++] = ((unsigned char)*p >= 32 && (unsigned char)*p < 127) ? *p : '?';
+            t[used] = 0;
+        }
+        return;
+    }
     if (!strcmp(l, "OK")) {
         finish(true);
     } else if (!strcmp(l, "ERROR") || startsWith(l, "+CME ERROR") || startsWith(l, "+CMS ERROR")) {
@@ -307,9 +564,10 @@ void PhoneModule::handleEvent(const char *l)
             LOG_INFO("Phone: call ended");
         status.call = PhoneStatus::CALL_IDLE;
         status.callNumber[0] = 0;
-    } else if (startsWith(l, "+CMTI:")) {
+    } else if (startsWith(l, "+CMTI:")) { // a new SMS, stored at this index: read it next
         const char *comma = strrchr(l, ',');
-        status.newSmsIndex = comma ? atoi(comma + 1) : -1;
+        if (comma && smsToReadCount < SMS_QUEUE)
+            smsToRead[smsToReadCount++] = (int16_t)atoi(comma + 1);
         LOG_INFO("Phone: new SMS");
     } else if (startsWith(l, "+CGNSSPWR: READY")) {
         gnssReady = true;
@@ -388,7 +646,63 @@ void PhoneModule::startNextJob()
             return;
         }
         needSetup = false;
+        smsListWanted = true; // then read the messages on the SIM
         LOG_INFO("Phone: modem set up");
+    }
+
+    // SMS work comes before the status questions
+    {
+        bool out;
+        int16_t toDelete = -1, toRead = -1;
+        char number[24] = "";
+        {
+            concurrency::LockGuard guard(&lock);
+            out = smsOutPending;
+            if (out) {
+                smsOutPending = false;
+                strlcpy(number, smsOutNumber, sizeof number);
+            } else if (smsToDeleteCount) {
+                toDelete = smsToDelete[0];
+                memmove(smsToDelete, smsToDelete + 1, --smsToDeleteCount * sizeof smsToDelete[0]);
+            } else if (smsToReadCount) {
+                toRead = smsToRead[0];
+                memmove(smsToRead, smsToRead + 1, --smsToReadCount * sizeof smsToRead[0]);
+            }
+        }
+        char cmd[40];
+        if (out) {
+            snprintf(cmd, sizeof cmd, "AT+CMGS=\"%s\"", number);
+            send(Job::SmsPrompt, cmd, 5000);
+            return;
+        }
+        if (toDelete >= 0) {
+            snprintf(cmd, sizeof cmd, "AT+CMGD=%d", toDelete);
+            send(Job::SmsDelete, cmd, 5000);
+            return;
+        }
+        if (toRead >= 0) {
+            smsReadingIndex = toRead;
+            snprintf(cmd, sizeof cmd, "AT+CMGR=%d", toRead);
+            send(Job::SmsRead, cmd, 5000);
+            return;
+        }
+        if (smsListWanted) {
+            smsListWanted = false;
+            {
+                // what's on the SIM is read again in full: forget the copies held
+                concurrency::LockGuard guard(&lock);
+                uint8_t kept = 0;
+                for (uint8_t i = 0; i < smsHeld; i++) {
+                    if (smsList[i].index < 0)
+                        smsList[kept++] = smsList[i];
+                }
+                smsHeld = kept;
+                smsRecount();
+                smsChanges++;
+            }
+            send(Job::SmsList, "AT+CMGL=\"ALL\"", 15000);
+            return;
+        }
     }
 
     if ((int32_t)(now - nextPollAt) < 0)
@@ -418,6 +732,9 @@ void PhoneModule::startNextJob()
         break;
     case 6:
         send(Job::Battery, "AT+CBC", 2000);
+        break;
+    case 8:
+        send(Job::Storage, "AT+CPMS?", 2000);
         break;
     case 7: {
         bool want = gnssWanted();
@@ -552,6 +869,46 @@ void PhoneModule::finish(bool ok)
             parseGnss(l);
         }
         break;
+    case Job::Storage:
+        if (ok && replyLine(reply, "+CPMS:", l, sizeof l)) {
+            char q[6][28];
+            if (quotedFields(l, q, 6) >= 3) {
+                concurrency::LockGuard guard(&lock);
+                status.smsStored = (uint8_t)atoi(q[1]);
+                status.smsCapacity = (uint8_t)atoi(q[2]);
+            }
+        }
+        break;
+    case Job::SmsRead:
+        if (ok) {
+            LOG_INFO("Phone: SMS received");
+            playTone(SMS_TONE, strlen(SMS_TONE));
+        }
+        break;
+    case Job::SmsList:
+        if (ok) {
+            concurrency::LockGuard guard(&lock);
+            LOG_INFO("Phone: %u SMS held", smsHeld);
+        }
+        break;
+    case Job::SmsPrompt: // no "> " from the modem
+    case Job::SmsBody: {
+        if (j == Job::SmsPrompt)
+            Serial1.write((uint8_t)0x1B); // Esc: cancel the message
+        bool sentOk = ok && j == Job::SmsBody;
+        LOG_INFO(sentOk ? "Phone: SMS sent" : "Phone: SMS not sent");
+        concurrency::LockGuard guard(&lock);
+        status.smsSend = sentOk ? PhoneStatus::SMS_SENT : PhoneStatus::SMS_FAILED;
+        if (sentOk) { // kept until restart, so the conversation shows it
+            PhoneSms m;
+            m.incoming = false;
+            strlcpy(m.number, smsOutNumber, sizeof m.number);
+            strlcpy(m.text, smsOutText, sizeof m.text);
+            timeNow(m.time, sizeof m.time);
+            smsKeep(m);
+        }
+        break;
+    }
     case Job::User:
         if (!ok) {
             LOG_WARN("Phone: call command not accepted");
