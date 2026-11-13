@@ -14,8 +14,10 @@
 
 #ifdef TDECK_PHONE
 
+#include "Observer.h"
 #include "concurrency/Lock.h"
 #include "concurrency/OSThread.h"
+#include <esp_sleep.h>
 #include <stdint.h>
 
 // PhoneStatus and IPhone are shared with the touch interface (rushikesh3982/device-ui, include/phone/IPhone.h).
@@ -96,6 +98,25 @@ class PhoneModule : public IPhone, private concurrency::OSThread
     bool ringtonePlaying = false;
     bool tonePlaying = false;
 
+    // Sleep and battery
+    int onPreflightSleep(void *);
+    int onLightSleep(void *);
+    int onLightSleepEnd(esp_sleep_wakeup_cause_t cause);
+    int onDeepSleep(void *);
+    CallbackObserver<PhoneModule, void *> preflightObserver =
+        CallbackObserver<PhoneModule, void *>(this, &PhoneModule::onPreflightSleep);
+    CallbackObserver<PhoneModule, void *> lightSleepObserver =
+        CallbackObserver<PhoneModule, void *>(this, &PhoneModule::onLightSleep);
+    CallbackObserver<PhoneModule, esp_sleep_wakeup_cause_t> lightSleepEndObserver =
+        CallbackObserver<PhoneModule, esp_sleep_wakeup_cause_t>(this, &PhoneModule::onLightSleepEnd);
+    CallbackObserver<PhoneModule, void *> deepSleepObserver =
+        CallbackObserver<PhoneModule, void *>(this, &PhoneModule::onDeepSleep);
+    bool wakeOnModem = false;
+    bool smsUnreadCheckWanted = false;
+    uint32_t nextBatteryCheckAt = 0;
+    uint8_t criticalReadings = 0;
+    void checkBattery();
+
     // SMS
     static constexpr uint8_t SMS_MAX = 30;   // held in RAM, newest first
     static constexpr uint8_t SMS_QUEUE = 6;
@@ -110,6 +131,9 @@ class PhoneModule : public IPhone, private concurrency::OSThread
     bool smsOutPending = false;
     char smsOutNumber[24] = "";
     char smsOutText[161] = "";
+    char smsUnreadTimes[SMS_MAX][24] = {}; // unread messages, remembered while the SIM is read again in full
+    uint8_t smsUnreadTimesCount = 0;
+    uint8_t unreadBeforeList = 0; // to chirp when a list (after a sleep) brings new messages
     PhoneSms smsBuilding;
     bool smsBuildingActive = false;
     int16_t smsReadingIndex = -1;

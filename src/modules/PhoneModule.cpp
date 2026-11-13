@@ -5,6 +5,10 @@
 #include "PhoneModule.h"
 #include "GPSStatus.h"
 #include "NodeDB.h"
+#include "PowerFSM.h"
+#include "PowerStatus.h"
+#include "sleep.h"
+#include <driver/gpio.h>
 #include "concurrency/LockGuard.h"
 #include "gps/RTC.h"
 #include <Arduino.h>
@@ -30,6 +34,10 @@ constexpr uint32_t ALIVE_GAP_MS = 2000;  // while the modem is off: one AT this 
 constexpr uint8_t LOST_AFTER = 3;        // unanswered ATs before the modem counts as off
 constexpr uint32_t GNSS_RETRY_MS = 90000; // GNSS off and on again if it hasn't said READY by then
 constexpr uint8_t POLL_STEPS = 9;
+constexpr uint32_t BATTERY_CHECK_MS = 10000;
+constexpr int BATTERY_LOW_MV = 3400;      // a warning on the screen
+constexpr int BATTERY_CRITICAL_MV = 3300; // the modem is switched off (as the bench docs planned with AT+CPMVT)
+constexpr uint8_t CRITICAL_READINGS = 3;  // in a row, so one dip during a transmit burst doesn't count
 
 // The ringtone (RTTTL): a plain double ring, then a pause. The modem rings again every few seconds, and it repeats.
 const char RINGTONE[] = "ring:d=16,o=6,b=200:e,c,e,c,e,c,e,c,4p,e,c,e,c,e,c,e,c,1p";
@@ -197,6 +205,97 @@ int twoDigits(const char *s)
 PhoneModule::PhoneModule() : concurrency::OSThread("Phone")
 {
     IPhone::set(this); // the touch interface's phone screens use this module
+    preflightObserver.observe(&preflightSleep);
+    lightSleepObserver.observe(&notifyLightSleep);
+    lightSleepEndObserver.observe(&notifyLightSleepEnd);
+    deepSleepObserver.observe(&notifyDeepSleep);
+}
+
+// Meshtastic asks before each light sleep: no sleep during a call, while a ringtone plays or an SMS is being sent.
+int PhoneModule::onPreflightSleep(void *)
+{
+    concurrency::LockGuard guard(&lock);
+    bool busy = status.call != PhoneStatus::CALL_IDLE || status.smsSend == PhoneStatus::SMS_SENDING || smsOutPending ||
+                job == Job::SmsPrompt || job == Job::SmsBody || ringtonePlaying || tonePlaying;
+    return busy ? 1 : 0;
+}
+
+// Just before a light sleep.
+int PhoneModule::onLightSleep(void *)
+{
+    // Wake when the modem starts talking: its line idles high, and the first start bit pulls it low. The characters
+    // that arrive while the T-Deck wakes up are lost: the modem repeats RING every few seconds, and new SMS are checked
+    // for again after every wake. If the line is already low (the modem's side unpowered), it isn't used, or the
+    // T-Deck would wake straight away again and again.
+    wakeOnModem = serialStarted && digitalRead(PHONE_MODEM_RX_PIN) == HIGH;
+    if (wakeOnModem)
+        gpio_wakeup_enable((gpio_num_t)PHONE_MODEM_RX_PIN, GPIO_INTR_LOW_LEVEL);
+#ifdef KB_POWERON
+    // The peripherals' power stays on: it also feeds the modem board's VDD (its level shifters) through the Grove 3.3 V
+    gpio_hold_en((gpio_num_t)KB_POWERON);
+#endif
+    return 0;
+}
+
+int PhoneModule::onLightSleepEnd(esp_sleep_wakeup_cause_t cause)
+{
+    if (wakeOnModem)
+        gpio_wakeup_disable((gpio_num_t)PHONE_MODEM_RX_PIN);
+    wakeOnModem = false;
+#ifdef KB_POWERON
+    gpio_hold_dis((gpio_num_t)KB_POWERON);
+#endif
+    smsUnreadCheckWanted = true; // an SMS that arrived during the sleep would have been missed
+    return 0;
+}
+
+// The T-Deck is shutting down, or going to deep sleep for a critically low battery: switch the modem off too. It has
+// its own switch, so it would otherwise go on draining the cell.
+int PhoneModule::onDeepSleep(void *)
+{
+    if (serialStarted) {
+        Serial1.print("AT+CPOF\r");
+        Serial1.flush();
+        delay(300);
+    }
+    return 0;
+}
+
+// Every 10 s: a warning below 3.4 V, and below 3.3 V (three readings in a row) the modem is switched off cleanly
+// (AT+CPOF) before the cell runs flat. The modem's own reading is used when it looks right (it is taken at the modem's
+// supply); on the bench it read about 0.01 V on 5 V, so otherwise the T-Deck's reading is used.
+void PhoneModule::checkBattery()
+{
+    if ((int32_t)(millis() - nextBatteryCheckAt) < 0)
+        return;
+    nextBatteryCheckAt = millis() + BATTERY_CHECK_MS;
+    if (!powerStatus || !powerStatus->getHasBattery())
+        return;
+    bool onUsb = powerStatus->getHasUSB();
+    uint16_t modemMv;
+    bool alive;
+    {
+        concurrency::LockGuard guard(&lock);
+        modemMv = status.modemMillivolts;
+        alive = status.modemAlive;
+    }
+    int mv = (modemMv >= 2800 && modemMv <= 4500) ? modemMv : powerStatus->getBatteryVoltageMv();
+    if (mv <= 0)
+        return;
+    bool critical = !onUsb && mv < BATTERY_CRITICAL_MV;
+    criticalReadings = critical ? criticalReadings + 1 : 0;
+    {
+        concurrency::LockGuard guard(&lock);
+        status.batteryLow = !onUsb && mv < BATTERY_LOW_MV;
+    }
+    if (alive && criticalReadings >= CRITICAL_READINGS) {
+        criticalReadings = 0;
+        LOG_WARN("Phone: battery at %d mV: switching the modem off", mv);
+        if (queueCommand("AT+CPOF")) {
+            concurrency::LockGuard guard(&lock);
+            status.modemOffForBattery = true;
+        }
+    }
 }
 
 PhoneStatus PhoneModule::getStatus()
@@ -322,15 +421,22 @@ void PhoneModule::smsRecount()
 }
 
 // With the lock held: adds a message, newest first, replacing one with the same place on the SIM.
-void PhoneModule::smsKeep(const PhoneSms &m)
+void PhoneModule::smsKeep(const PhoneSms &message)
 {
+    PhoneSms m = message;
     if (m.index >= 0) {
         for (uint8_t i = 0; i < smsHeld; i++) {
             if (smsList[i].index == m.index) {
+                if (smsList[i].unread && !strcmp(smsList[i].time, m.time))
+                    m.unread = true; // still unread here, though reading it marked it read on the SIM
                 memmove(&smsList[i], &smsList[i + 1], (smsHeld - i - 1) * sizeof(PhoneSms));
                 smsHeld--;
                 break;
             }
+        }
+        for (uint8_t i = 0; i < smsUnreadTimesCount && !m.unread; i++) {
+            if (m.incoming && m.time[0] && !strcmp(smsUnreadTimes[i], m.time))
+                m.unread = true;
         }
     }
     uint8_t at = 0;
@@ -423,6 +529,7 @@ int32_t PhoneModule::runOnce()
     if (!serialStarted) {
         Serial1.setRxBufferSize(2048);
         Serial1.begin(BAUD, SERIAL_8N1, PHONE_MODEM_RX_PIN, PHONE_MODEM_TX_PIN);
+        gpio_pullup_en((gpio_num_t)PHONE_MODEM_RX_PIN); // a defined level when the modem is off, for the sleep wake
         serialStarted = true;
         nextPollAt = millis() + 1000;
         LOG_INFO("Phone: modem port open (RX %d, TX %d)", PHONE_MODEM_RX_PIN, PHONE_MODEM_TX_PIN);
@@ -434,6 +541,7 @@ int32_t PhoneModule::runOnce()
     if (job == Job::None)
         startNextJob();
     ring();
+    checkBattery();
 #ifdef HAS_I2S
     if (tonePlaying && (!audioThread || !audioThread->isPlaying())) // isPlaying() also advances the tone
         tonePlaying = false;
@@ -549,8 +657,10 @@ void PhoneModule::handleEvent(const char *l)
 {
     concurrency::LockGuard guard(&lock);
     if (!strcmp(l, "RING")) {
-        if (status.call != PhoneStatus::CALL_RINGING && status.call != PhoneStatus::CALL_ACTIVE)
+        if (status.call != PhoneStatus::CALL_RINGING && status.call != PhoneStatus::CALL_ACTIVE) {
             LOG_INFO("Phone: incoming call");
+            powerFSM.trigger(EVENT_INPUT); // awake, as for a key press
+        }
         if (status.call != PhoneStatus::CALL_ACTIVE)
             status.call = PhoneStatus::CALL_RINGING;
     } else if (startsWith(l, "+CLIP:")) {
@@ -584,6 +694,9 @@ void PhoneModule::modemLost()
     concurrency::LockGuard guard(&lock);
     PhoneStatus off;
     strlcpy(off.model, status.model, sizeof off.model);
+    off.unreadSms = status.unreadSms; // the messages held stay
+    off.batteryLow = status.batteryLow;
+    off.modemOffForBattery = status.modemOffForBattery;
     status = off;
     needSetup = true;
     setupStep = 0;
@@ -620,9 +733,10 @@ void PhoneModule::startNextJob()
 
     if (needSetup) {
         // Echo off; the caller's number with each ring; SMS as text, announced when they arrive; call sound to the
-        // earpiece, at the volume (5) and mic gain (4) found right on the bench.
-        static const char *const SETUP[] = {"ATE0",       "AT+CLIP=1",     "AT+CMGF=1",    "AT+CNMI=2,1,0,0,0",
-                                            "AT+CSDVC=1", "AT+COUTGAIN=5", "AT+CMICGAIN=4"};
+        // earpiece, at the volume (5) and mic gain (4) found right on the bench; no data-connection reports (they would
+        // only wake the T-Deck).
+        static const char *const SETUP[] = {"ATE0",          "AT+CLIP=1",     "AT+CMGF=1",  "AT+CNMI=2,1,0,0,0",
+                                            "AT+CSDVC=1",    "AT+COUTGAIN=5", "AT+CMICGAIN=4", "AT+CGEREP=0"};
         constexpr uint8_t N = sizeof SETUP / sizeof SETUP[0];
         if (setupStep < N) {
             send(Job::Setup, SETUP[setupStep++], 2000);
@@ -688,19 +802,34 @@ void PhoneModule::startNextJob()
         }
         if (smsListWanted) {
             smsListWanted = false;
+            smsUnreadCheckWanted = false;
             {
-                // what's on the SIM is read again in full: forget the copies held
+                // What's on the SIM is read again in full: forget the copies held, but remember which were unread
+                // (reading them from the SIM marked them read there).
                 concurrency::LockGuard guard(&lock);
                 uint8_t kept = 0;
+                smsUnreadTimesCount = 0;
                 for (uint8_t i = 0; i < smsHeld; i++) {
                     if (smsList[i].index < 0)
                         smsList[kept++] = smsList[i];
+                    else if (smsList[i].unread)
+                        strlcpy(smsUnreadTimes[smsUnreadTimesCount++], smsList[i].time, sizeof smsUnreadTimes[0]);
                 }
                 smsHeld = kept;
                 smsRecount();
                 smsChanges++;
             }
+            unreadBeforeList = 255; // no chirp for what was already there
             send(Job::SmsList, "AT+CMGL=\"ALL\"", 15000);
+            return;
+        }
+        if (smsUnreadCheckWanted) { // after a sleep: any SMS that arrived meanwhile
+            smsUnreadCheckWanted = false;
+            {
+                concurrency::LockGuard guard(&lock);
+                unreadBeforeList = status.unreadSms;
+            }
+            send(Job::SmsList, "AT+CMGL=\"REC UNREAD\"", 15000);
             return;
         }
     }
@@ -781,8 +910,11 @@ void PhoneModule::finish(bool ok)
         {
             concurrency::LockGuard guard(&lock);
             was = status.modemAlive;
-            if (ok)
+            if (ok) {
                 status.modemAlive = true;
+                if (!was)
+                    status.modemOffForBattery = false; // switched on again
+            }
         }
         if (ok) {
             missedAts = 0;
@@ -885,12 +1017,19 @@ void PhoneModule::finish(bool ok)
             playTone(SMS_TONE, strlen(SMS_TONE));
         }
         break;
-    case Job::SmsList:
-        if (ok) {
+    case Job::SmsList: {
+        bool newOnes;
+        {
             concurrency::LockGuard guard(&lock);
-            LOG_INFO("Phone: %u SMS held", smsHeld);
+            smsUnreadTimesCount = 0;
+            newOnes = ok && unreadBeforeList != 255 && status.unreadSms > unreadBeforeList;
+            if (ok)
+                LOG_INFO("Phone: %u SMS held", smsHeld);
         }
+        if (newOnes)
+            playTone(SMS_TONE, strlen(SMS_TONE));
         break;
+    }
     case Job::SmsPrompt: // no "> " from the modem
     case Job::SmsBody: {
         if (j == Job::SmsPrompt)
