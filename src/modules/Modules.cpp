@@ -4,6 +4,9 @@
 #include "modules/SystemCommandsModule.h"
 #endif
 #include "modules/StatusLEDModule.h"
+#ifdef TDECK_PHONE
+#include "modules/PhoneModule.h"
+#endif
 #if !MESHTASTIC_EXCLUDE_REPLYBOT
 #include "ReplyBotModule.h"
 #endif
@@ -117,6 +120,9 @@ void setupModules()
     }
 #endif
     statusLEDModule = new StatusLEDModule();
+#ifdef TDECK_PHONE
+    phoneModule = new PhoneModule(); // T-Deck phone: the 4G modem on the Grove pins
+#endif
 #if !MESHTASTIC_EXCLUDE_REPLYBOT
     new ReplyBotModule();
 #endif

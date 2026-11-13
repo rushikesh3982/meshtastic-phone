@@ -37,9 +37,16 @@
 #define BUTTON_ACTIVE_LOW true
 #define BUTTON_ACTIVE_PULLUP true
 
+#ifndef TDECK_PHONE
 #define GPS_DEFAULT_NOT_PRESENT 1
 #define GPS_RX_PIN 44
 #define GPS_TX_PIN 43
+#else
+// T-Deck phone: the Grove pins go to the 4G modem instead of a GPS module (src/modules/PhoneModule.cpp). The modem's
+// own GNSS is the GPS.
+#define PHONE_MODEM_RX_PIN 44
+#define PHONE_MODEM_TX_PIN 43
+#endif
 
 // Have SPI interface SD card slot
 // #define HAS_SDCARD // --> needs to be in platform.ini for device-ui
