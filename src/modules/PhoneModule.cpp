@@ -12,6 +12,9 @@
 #if !MESHTASTIC_EXCLUDE_GPS
 #include "modules/PositionModule.h"
 #endif
+#ifdef HAS_I2S
+#include "main.h" // audioThread: the T-Deck's speaker
+#endif
 
 #ifndef PHONE_MODEM_RX_PIN
 #error "TDECK_PHONE needs PHONE_MODEM_RX_PIN and PHONE_MODEM_TX_PIN (see variants/esp32s3/t-deck/variant.h)"
@@ -27,6 +30,9 @@ constexpr uint32_t ALIVE_GAP_MS = 2000;  // while the modem is off: one AT this 
 constexpr uint8_t LOST_AFTER = 3;        // unanswered ATs before the modem counts as off
 constexpr uint32_t GNSS_RETRY_MS = 90000; // GNSS off and on again if it hasn't said READY by then
 constexpr uint8_t POLL_STEPS = 8;
+
+// The ringtone (RTTTL): a plain double ring, then a pause. The modem rings again every few seconds, and it repeats.
+const char RINGTONE[] = "ring:d=16,o=6,b=200:e,c,e,c,e,c,e,c,4p,e,c,e,c,e,c,e,c,1p";
 
 // Lines the modem sends by itself, not as a reply to a question.
 const char *const EVENTS[] = {"RING",        "+CLIP:", "VOICE CALL:", "NO CARRIER", "BUSY",     "NO ANSWER",
@@ -127,7 +133,10 @@ int twoDigits(const char *s)
 }
 } // namespace
 
-PhoneModule::PhoneModule() : concurrency::OSThread("Phone") {}
+PhoneModule::PhoneModule() : concurrency::OSThread("Phone")
+{
+    IPhone::set(this); // the touch interface's phone screens use this module
+}
 
 PhoneStatus PhoneModule::getStatus()
 {
@@ -197,7 +206,31 @@ int32_t PhoneModule::runOnce()
         finish(false);
     if (job == Job::None)
         startNextJob();
-    return job == Job::None ? 50 : 20;
+    ring();
+    return (job == Job::None && !ringtonePlaying) ? 50 : 20;
+}
+
+// The ringtone on the T-Deck's speaker while a call rings. The player only advances when asked (isPlaying), so this
+// runs every 20 ms while ringing.
+void PhoneModule::ring()
+{
+#ifdef HAS_I2S
+    if (!audioThread)
+        return;
+    bool ringing;
+    {
+        concurrency::LockGuard guard(&lock);
+        ringing = status.call == PhoneStatus::CALL_RINGING;
+    }
+    if (ringing) {
+        if (!audioThread->isPlaying())
+            audioThread->beginRttl(RINGTONE, strlen(RINGTONE));
+        ringtonePlaying = true;
+    } else if (ringtonePlaying) {
+        audioThread->stop();
+        ringtonePlaying = false;
+    }
+#endif
 }
 
 void PhoneModule::send(Job j, const char *cmd, uint32_t timeout)

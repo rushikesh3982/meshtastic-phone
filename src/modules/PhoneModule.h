@@ -18,45 +18,21 @@
 #include "concurrency/OSThread.h"
 #include <stdint.h>
 
-// What the phone knows about the modem. The touch interface reads a copy (PhoneModule::getStatus).
-struct PhoneStatus {
-    bool modemAlive = false; // the modem answers
-    char model[24] = "";     // e.g. A7672S-FASE
+// PhoneStatus and IPhone are shared with the touch interface (rushikesh3982/device-ui, include/phone/IPhone.h).
+#include "phone/IPhone.h"
 
-    enum Sim : uint8_t { SIM_UNKNOWN, SIM_READY, SIM_NEEDS_PIN, SIM_MISSING };
-    Sim sim = SIM_UNKNOWN;
-
-    int8_t registration = -1; // +CEREG: 1 home, 5 roaming, 2 searching, 3 refused, 0 not searching, -1 unknown
-    char operatorName[24] = "";
-    bool volte = false;       // registered for calls over 4G
-    bool lte = false;         // on 4G now
-    int16_t rsrpDbm = 0;      // 4G signal, 0 = unknown
-    int16_t band = -1;
-    uint16_t modemMillivolts = 0;
-
-    bool gnssOn = false;
-    bool gnssFix = false;
-    uint8_t satellites = 0;
-
-    enum Call : uint8_t { CALL_IDLE, CALL_RINGING, CALL_DIALING, CALL_ACTIVE };
-    Call call = CALL_IDLE;
-    char callNumber[24] = ""; // the other party, while ringing or in a call
-
-    int16_t newSmsIndex = -1; // the index of the latest SMS that arrived, -1 = none
-};
-
-class PhoneModule : private concurrency::OSThread
+class PhoneModule : public IPhone, private concurrency::OSThread
 {
   public:
     PhoneModule();
 
     // A copy of the current state. Safe from any task.
-    PhoneStatus getStatus();
+    PhoneStatus getStatus() override;
 
     // Calls. Safe from any task: the command is queued, and sent on the module's next turn.
-    bool dial(const char *number);
-    bool answer();
-    bool hangUp();
+    bool dial(const char *number) override;
+    bool answer() override;
+    bool hangUp() override;
 
   protected:
     int32_t runOnce() override;
@@ -90,6 +66,9 @@ class PhoneModule : private concurrency::OSThread
     bool gnssReady = false;
     uint32_t gnssStartedAt = 0;
     bool gnssRestart = false;
+    bool ringtonePlaying = false;
+
+    void ring();
 
     void send(Job j, const char *cmd, uint32_t timeout);
     void finish(bool ok);
